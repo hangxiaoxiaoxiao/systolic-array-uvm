@@ -1,0 +1,27 @@
+# Local files and intermediate artifacts
+.DS_Store
+work/
+tmp/
+build/
+sim/results/
+
+# Simulation outputs
+*.log
+*.vcd
+*.fst
+*.wlf
+*.fsdb
+*.vpd
+*.ucdb
+*.vdb/
+simv
+simv.daidir/
+csrc/
+transcript
+
+# Local credentials and source reference material
+.env
+.env.*
+*.pem
+*.key
+*.pdf
