@@ -1,24 +1,23 @@
 # DV Architecture and Proposed Assumptions
 
-Status: **proposal v0.1 — open for discussion.** This document is the
+Status: **v0.2 — assumptions frozen on 2026-09-27 (section 8).** This document is the
 companion to [`spec-questions.md`](spec-questions.md) and
 [`verification-plan.md`](verification-plan.md): where those two list what the
 assignment leaves open, this one proposes a concrete default for each item
 (`A<n>` below), the testbench architecture that keeps every default isolated
 behind one config field or helper function, and the checkers, tests and
-coverage that follow from them. Nothing here is implemented yet.
+coverage that follow from them. Implementation starts from this version.
 
 | `spec-questions.md` item | proposed default below |
 |---|---|
-| frame boundary, `in_valid`/`out_valid` semantics, per-lane element mapping | A1, A2, A3 |
-| `c_din` loop-back, `M != N` scheduling | A5 (with A1/A2) |
-| arithmetic width, overflow policy | A6 |
-| `din`/`dout` bit layout | A7 |
-| FIFO handshake, read latency, write-when-full | A8 |
-| `M_minus_one` latching | A9 |
-| output-FIFO back-pressure | A10 |
-| clock relationship, reset semantics | A11, A12 |
-| latency / throughput checks | A13 |
+| frame boundary, `in_valid`/`out_valid` semantics, per-lane element mapping | A1–A4, A6, A7 |
+| `c_din` loop-back, `M != N` scheduling | A2, A5 |
+| arithmetic width, overflow policy | A8 |
+| `din`/`dout` bit layout, alignment unit | A9, A10 |
+| FIFO handshake, read latency, write-when-full | A12 |
+| `M_minus_one` latching, output-FIFO back-pressure, `M < N` | A11 |
+| clock relationship, reset semantics | A13, A14 |
+| latency / throughput checks | A15 |
 
 ---
 
@@ -42,85 +41,141 @@ Out of scope: the `D` addend (`C = AxB + D`) — explicitly dropped by the assig
 
 ## 2. Interface contract and assumptions
 
-### 2.1 Data ordering (both levels)
+The module is read as the weight-stationary array of the assignment figures,
+generalised to `N x N`: B is preloaded into the PEs (double-buffered), rows of
+A stream from the left, partial sums flow down the columns, and `M > N` is
+handled by processing B in chunks of `N` rows with the `c_din`/`c_dout`
+loop-back. This reading matches the PE definition (`cout = a*b + cin`), the
+double-buffered weight storage, the per-column weight-buffer control signals,
+the loop-back, and the cycle numbers on the "double buffered" figure
+(`N = M = 2`: first result at cycle 6, second at cycle 8). The one statement it
+does not reproduce literally is "M computing clock cycles": the throughput of
+this design is `ceil(M/N) * N` cycles per multiplication, which equals `M` when
+`N` divides `M`.
 
-* **A1 — one sample per cycle = one column of A + one row of B.**
-  On sample `k` (`k = 0..M-1`): `a_din[i] = A[i][k]` for `i = 0..N-1`,
-  `b_din[j] = B[k][j]` for `j = 0..N-1`. This is the outer-product formulation
-  `C = sum_k A[:,k] (x) B[k,:]` and is the only reading consistent with the
-  interface widths (`N` elements of A per sample although A has `M` columns)
-  and with the sub-system statement "each sample includes one column of A and
-  one row of B".
-* **A2 — the M samples of one matrix multiplication are presented on M
-  consecutive clock cycles**, `in_valid = 1` only on the last one (`k = M-1`).
-  There is no per-sample valid, so a matrix starts on the cycle after the
-  previous `in_valid` (or after reset). Idle cycles between multiplications are
-  allowed; during idle the driver drives `a_din = b_din = 0`, which contributes
-  nothing to an accumulating array.
-* **A3 — output order.** `c_dout` delivers `C` one **row** per cycle on `N`
-  consecutive cycles, row `0` first, `out_valid = 1` on the last row
-  (`c_dout[j] = C[i][j]` on the cycle for row `i`). This is the de-skewed
-  ("data aligned") view. Config knob `io_skewed` switches driver and monitor
-  to the diagonal wavefront shown in the assignment figures (column `j` delayed
-  by `j` cycles) in case the raw module exposes skewed I/O.
-* **A4 — `c_dout` is zero whenever no result row is being presented.**
-  Checked against the cycle model's output window.
+### 2.1 Slot protocol (module level)
 
-### 2.2 Partial-sum input
+* **A1 — time is divided into slots of `N` clock cycles, anchored to the first
+  cycle after `rst_n` deassertion.** The module has no start signal, so the
+  slot phase is defined by reset. Slot `s` covers cycles `[sN, sN+N)`.
+* **A2 — chunking.** A multiplication with inner dimension `M` uses
+  `K = ceil(M/N)` chunks. Chunk `c` consists of A columns `[cN, cN+N)` and B
+  rows `[cN, cN+N)`; columns/rows beyond `M` are zero-padded. Chunk `c` is
+  computed in one slot; the `K` slots of one multiplication are consecutive.
+* **A3 — `a_din` carries rows of A, lane `k` = column `k` of the chunk.** In
+  the slot that computes chunk `c`, `a_din[k]` presents `A[r][cN+k]` for row
+  `r = 0..N-1` on slot cycle `r`, delayed by `k` cycles (diagonal wavefront:
+  lane `k` is `k` cycles behind lane 0). The wavefront is applied by the TB
+  driver / the sub-system alignment unit; the module exposes the raw PE
+  boundary (an `io_skewed = 0` variant with the skew registers inside the
+  model is possible but not implemented).
+* **A4 — `b_din` preloads the *next* slot's chunk of B, one row per cycle in
+  reverse row order.** During slot `s`, `b_din[j]` presents `B[cN+N-1-i][j]`
+  on slot cycle `i` (`i = 0..N-1`), delayed by `j` cycles, for the chunk that
+  slot `s+1` will compute. The rows shift down the column through the PE's
+  forwarded-weight path, are captured into the shadow weight register of every
+  PE in column `j` when the last row arrives (slot cycle `N-1+j`), and are
+  swapped into the active weight register of PE `(k, j)` at slot cycle
+  `k + j` of the next slot — the "weight buffer control signals propagated
+  per column". The first chunk of the first multiplication after reset
+  therefore needs one preload-only slot (`a_din = 0`).
+* **A5 — `c_din` / loop-back.** `c_din[j]` is the partial-sum input of
+  `PE(0, j)`. For the first chunk of a multiplication it is 0; for chunk
+  `c > 0` it is `c_dout[j]` of the same cycle (the partial sum of row `r`
+  leaves column `j` at `t_r + N + j` and row `r` of the next chunk reaches
+  `PE(0, j)` at `t_r + N + j`, so the loop-back is a direct connection gated
+  by a per-lane "first chunk" mask). At module level the mask is generated by
+  the driver and the gating lives in a small shim in `tb_top`; in the
+  sub-system it is part of the controller. The same shim is reused at both
+  levels.
+* **A6 — `in_valid` / `out_valid`.** `in_valid` is a single-cycle pulse on the
+  slot cycle where lane 0 presents the last row of the last chunk
+  (`sN + N - 1`). `out_valid` is a single-cycle pulse when the last element
+  `C[N-1][N-1]` leaves `c_dout[N-1]`: `2N - 1` cycles after `in_valid`
+  (`N = 2`: `in_valid` at cycle 3, `out_valid` at cycle 6).
+* **A7 — `c_dout`.** `c_dout[j]` carries `C[r][j]` (final chunk) or the
+  running partial sum (earlier chunks) at `t_r + N + j`, where `t_r` is the
+  slot cycle on which lane 0 presented row `r`. Between multiplications, with
+  `a_din = 0` and `c_din = 0`, the outputs are 0. The monitor reconstructs
+  `C` from the window ending at `out_valid`; it never hard-codes the
+  latency beyond the wavefront geometry above.
 
-* **A5 — `c_din` is driven to 0 at module level.** The assignment says the
-  signal "needs to be reset to 0 when a new matrix starts" and that loop-back
-  is a top-level/controller concern. With A1/A2 the module accumulates the
-  `M` partial products internally, so loop-back is not needed for `M > N`.
-  A `c_din_loopback` knob in the driver emulates the controller
-  (`c_din <= c_dout` of the previous cycle, forced to 0 on the first sample of
-  a matrix) for exploratory tests only; it is off by default.
+Cycle table, `N = 2`, `M = 2`, one multiplication (matches the assignment
+figures: `a11` at cycle 2, `c11` at 4, `c22` at 6):
 
-### 2.3 Arithmetic
+| cycle | slot | `a_din[0]` | `a_din[1]` | `b_din[0]` | `b_din[1]` | `in_valid` | `c_dout[0]` | `c_dout[1]` | `out_valid` |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 0 | 0 | 0 | `B[1][0]` | 0 | 0 | 0 | 0 | 0 |
+| 1 | 0 | 0 | 0 | `B[0][0]` | `B[1][1]` | 0 | 0 | 0 | 0 |
+| 2 | 1 | `A[0][0]` | 0 | next `B[1][0]` | `B[0][1]` | 0 | 0 | 0 | 0 |
+| 3 | 1 | `A[1][0]` | `A[0][1]` | next `B[0][0]` | next `B[1][1]` | **1** | 0 | 0 | 0 |
+| 4 | 2 | next `A[0][0]` | `A[1][1]` | … | next `B[0][1]` | 0 | `C[0][0]` | 0 | 0 |
+| 5 | 2 | … | … | … | … | … | `C[1][0]` | `C[0][1]` | 0 |
+| 6 | 3 | … | … | … | … | … | … | `C[1][1]` | **1** |
 
-* **A6 — signed two's-complement, accumulator wraps.** The exact sum needs
-  `2*DIN_WIDTH + ceil(log2(M))` bits but the output is `2*DIN_WIDTH` bits;
-  e.g. `DIN_WIDTH = 8`, `M = 2`: `(-128)*(-128)*2 = 32768 > 32767`.
-  The reference model computes the exact sum in a wide integer and truncates
-  to `2*DIN_WIDTH` bits (modular wrap). A `no_overflow` constraint mode limits
+Cycle table, `N = 2`, `M = 4` (two chunks; `A` is `2 x 4`, `B` is `4 x 2`):
+
+| slot | cycles | `a_din` lanes (skewed) | `b_din` (skewed, reverse rows) | `c_din` | notes |
+|---|---|---|---|---|---|
+| 0 | 0–1 | 0 | `B[1]`, `B[0]` (chunk 0) | 0 | preload only |
+| 1 | 2–3 | `A[r][0]`, `A[r][1]` | `B[3]`, `B[2]` (chunk 1) | 0 | first chunk |
+| 2 | 4–5 | `A[r][2]`, `A[r][3]` | next multiplication's chunk 0 | `c_dout` | loop-back; `in_valid` at 5 |
+| 3 | 6–7 | next … | … | 0 | `C[0][0]` at 6, `C[1][0]`/`C[0][1]` at 7 |
+| 4 | 8 | | | | `C[1][1]` at 8, `out_valid` at 8 |
+
+### 2.2 Arithmetic
+
+* **A8 — signed two's-complement, accumulator wraps.** Products are
+  `2*DIN_WIDTH` bits; the column sum and the loop-back path are also
+  `2*DIN_WIDTH` bits, so the exact sum (`2*DIN_WIDTH + ceil(log2(M))` bits)
+  wraps modulo `2^(2*DIN_WIDTH)`; e.g. `DIN_WIDTH = 8`, `M = 2`:
+  `(-128)*(-128)*2 = 32768 > 32767`. The reference model computes the exact
+  sum in a wide integer and truncates. A `no_overflow` constraint mode limits
   `|A|, |B| <= floor(sqrt((2^(2*DIN_WIDTH-1) - 1) / M))` for clean directed
   tests; the default random mode uses the full range so the wrap path is
   exercised and covered.
 
-### 2.4 Sub-system bus
+### 2.3 Sub-system
 
-* **A7 — `din` packing.** `din[N*DIN_WIDTH-1:0]` = the A column,
-  element `i` at `[i*DIN_WIDTH +: DIN_WIDTH]`; `din[2*N*DIN_WIDTH-1:N*DIN_WIDTH]`
-  = the B row, element `j` at `[N*DIN_WIDTH + j*DIN_WIDTH +: DIN_WIDTH]`.
-  `dout` carries one C row, element `j` at `[j*2*DIN_WIDTH +: 2*DIN_WIDTH]`.
-  One `pack_sample()/unpack_sample()/pack_row()/unpack_row()` set in
-  `tb/common` is the only place that knows this layout.
-* **A8 — FIFO handshake.** `wr_fifo` is a write strobe sampled on `sys_clk`;
-  the TB never asserts it while `in_fifo_full = 1` (a negative test verifies
-  such a write is ignored). `rd_fifo` is a pop strobe; `dout` is valid on the
-  cycle **after** `rd_fifo` is sampled with `out_fifo_empty = 0`
-  (standard, non-FWFT FIFO). Knob `fifo_fwft` switches the monitor to
-  first-word-fall-through.
-* **A9 — `M_minus_one` is quasi-static.** It may only change while the
-  sub-system is idle (all launched multiplications drained). Tests change it
-  between batches, never mid-stream.
-* **A10 — no output data loss under back-pressure.** The array cannot stall,
-  so the controller launches a multiplication only when the output FIFO has
-  room for `N` rows. The TB checks with slow readers that every row arrives
-  exactly once, in order.
-* **A11 — clocks are asynchronous** (arbitrary ratio and phase). FIFO depth
-  is a model parameter (`FIFO_DEPTH`, default 16 samples).
+* **A9 — `din` packing (bus format).** One sample per write: A **column**
+  `k` in `din[N*DIN_WIDTH-1:0]` (element `i` at `[i*DIN_WIDTH +: DIN_WIDTH]`)
+  and B **row** `k` in `din[2*N*DIN_WIDTH-1:N*DIN_WIDTH]` (element `j` at
+  `[N*DIN_WIDTH + j*DIN_WIDTH +: DIN_WIDTH]`), `k = 0..M-1` in order. `dout`
+  carries one row of `C`, element `j` at `[j*2*DIN_WIDTH +: 2*DIN_WIDTH]`,
+  rows in order. One `pack_sample()/unpack_sample()/pack_row()/unpack_row()`
+  set in `tb/common` is the only place that knows this layout.
+* **A10 — data alignment unit.** Because the bus delivers A by columns and the
+  array consumes A by rows, the alignment unit collects one chunk (`N`
+  samples) into an `N x N` transpose buffer, then streams its rows to
+  `a_din` with the wavefront of A3, streams the chunk's B rows in reverse
+  order to `b_din` one slot earlier (A4), and de-skews `c_dout` into rows for
+  the output FIFO. Pipeline per chunk: read samples (slot `s`) → preload B
+  (slot `s+1`) → stream A (slot `s+2`).
+* **A11 — controller launch rule.** All chunks of one multiplication must
+  occupy consecutive slots (the loop-back has no storage), so the controller
+  launches a multiplication only when the input FIFO holds all `M` samples
+  and the output FIFO has room for `N` rows. `FIFO_DEPTH` (default 256
+  samples) therefore bounds the supported `M`. `M_minus_one` is sampled at
+  launch and may only change while the sub-system is idle.
+* **A12 — FIFO handshake.** `wr_fifo` is a write strobe sampled on
+  `sys_clk`; the TB never asserts it while `in_fifo_full = 1` (a negative
+  test verifies such a write is ignored). `rd_fifo` is a pop strobe; `dout`
+  is valid on the cycle **after** `rd_fifo` is sampled with
+  `out_fifo_empty = 0` (standard, non-FWFT FIFO). Knob `fifo_fwft` switches
+  the monitor to first-word-fall-through.
+* **A13 — clocks are asynchronous** (arbitrary ratio and phase). Both FIFOs
+  are dual-clock FIFOs with gray-coded pointers and two-flop synchronisers.
 
-### 2.5 Reset and timing
+### 2.4 Reset and timing
 
-* **A12 — `rst_n` is asynchronous-assert, synchronous-deassert** in every
+* **A14 — `rst_n` is asynchronous-assert, synchronous-deassert** in every
   domain. A reset in the middle of traffic discards in-flight data; the
   scoreboard flushes its expectation queue on reset.
-* **A13 — latency is defined by the cycle model**, not hard-coded in the TB.
-  Monitors align on `in_valid` / `out_valid` only (sliding window of the last
-  `N` — or `2N-1` when skewed — rows). Expected latency
-  `L(N, M)` and the `M`-cycle throughput are derived from the model and
-  checked by SVA properties that can be disabled for a DUT with different timing.
+* **A15 — latency is a property of the model, checked but not hard-coded in
+  the TB.** Monitors align on `in_valid` / `out_valid` and the wavefront
+  geometry only. Expected latency and the `ceil(M/N) * N` throughput are
+  derived from the model and checked by SVA properties that can be disabled
+  for a DUT with different timing.
 
 ---
 
@@ -167,15 +222,15 @@ Out of scope: the `D` addend (`C = AxB + D`) — explicitly dropped by the assig
 
 | Check | Where | Notes |
 |---|---|---|
-| `C == ref(A, B)` per multiplication, in order | scoreboard | reference model in `tb/common`, wrap per A6 |
+| `C == ref(A, B)` per multiplication, in order | scoreboard | reference model in `tb/common`, wrap per A8 |
 | every launched multiplication produces exactly one result | scoreboard | end-of-test: expectation queue empty |
-| `c_dout == 0` outside result windows (A4) | SVA / monitor | window from cycle model |
+| `c_dout == 0` between multiplications (A7) | SVA / monitor | idle slots only |
 | `out_valid` pulses once per `in_valid`, never without one | SVA | |
-| latency `L(N, M)` and `M`-cycle throughput (A13) | SVA | disable-able |
-| no write while full is honoured, no data loss under slow reader (A8, A10) | bus monitor + scoreboard | |
-| reset flushes state (A12) | scoreboard + directed test | |
+| latency `2N-1` after `in_valid`, `ceil(M/N)*N` throughput (A15) | SVA | disable-able |
+| no write while full is honoured, no data loss under slow reader (A11, A12) | bus monitor + scoreboard | |
+| reset flushes state (A14) | scoreboard + directed test | |
 | internal array result == FIFO result (sub-system) | passive `sa_agent` | white-box cross-check |
-| TB self-check: injected model bugs are caught | `sim/` regression | e.g. drop the last partial product when `M > N` |
+| TB self-check: injected model bugs are caught | `sim/` regression | e.g. swap weights one cycle early, or drop the loop-back on the last chunk |
 
 ---
 
@@ -190,21 +245,21 @@ random `M`, random signed data, random idle gaps (module level) or random
 | `smoke` | both | one multiplication, `M = N`, small values |
 | `rand_consecutive` | both | 50+ back-to-back multiplications, random `M` in `[1, 16]`, no gaps |
 | `rand_gaps` | both | random idle cycles / bus pacing between multiplications |
-| `m_extremes` | both | `M = 1`, `M = N`, `M = 256` |
+| `m_extremes` | both | `M = 1`, `M = N`, `M = N+1` (two chunks, one padded), `M = 256` |
 | `data_extremes` | both | all `+max`, all `-min`, alternating signs, zeros |
-| `overflow_wrap` | both | forces accumulator wrap (A6) |
+| `overflow_wrap` | both | forces accumulator wrap (A8) |
 | `reset_midstream` | both | reset during input / compute / output phases |
 | `clk_ratio_sweep` | sub-system | `sys:sr` = 1:1, 2:1, 1:2, 3:2, 1:3, random phase |
 | `backpressure` | sub-system | fast writer vs. slow reader and vice-versa; hits `in_fifo_full` and `out_fifo_empty` |
-| `m_change_between_batches` | sub-system | A9 |
-| `write_when_full` | sub-system | negative test for A8 |
+| `m_change_between_batches` | sub-system | A11 |
+| `write_when_full` | sub-system | negative test for A12 |
 | `param_sweep` | both | `N in {2, 4, 8}`, `DIN_WIDTH in {4, 8, 16}` via regression script |
 
 ---
 
 ## 6. Functional coverage
 
-* `M` bins: `1`, `2..N-1`, `N`, `N+1..255`, `256`
+* `M` bins: `1`, `2..N-1`, `N`, `N+1..2N` (padded chunk), `2N+1..255`, `256`; number of chunks `1`, `2`, `>2`
 * data: per-element extremes (`min`, `-1`, `0`, `1`, `max`) on A and B
 * accumulator overflow occurred / not occurred per multiplication
 * idle gap between multiplications: `0`, `1`, `>1`
@@ -219,17 +274,24 @@ random `M`, random signed data, random idle gaps (module level) or random
 * Source under `tb/`, `rtl_model/`, run scripts under `sim/`.
 * `docs/`: this plan (final version), DV structure, list of frozen assumptions.
 * `results/`: logs and waveform screenshots of consecutive multiplications at
-  both levels. Primary simulator: EDA Playground (UVM 1.2); the file set is
-  kept EDA-Playground-friendly (few files, includes via `` `include ``).
+  both levels. Primary simulator: Verilator 5.x with the Accellera UVM 2020
+  library (`sim/Makefile`), waveforms as FST/VCD viewed in GTKWave. The file
+  set is also kept EDA-Playground-friendly (few files, includes via
+  `` `include ``) so the same tests can be re-run on a commercial simulator.
 
 ---
 
-## 8. Open questions to settle before implementation
+## 8. Decisions taken (2026-09-27)
 
-1. A3: does the raw `systolic_array` expose aligned or diagonal-skewed I/O? (default: aligned)
-2. A5: should module-level tests exercise `c_din` loop-back at all? (default: no)
-3. A6: wrap vs. saturate on accumulator overflow? (default: wrap)
-4. A8: standard vs. FWFT output FIFO? (default: standard)
-5. Micro-architecture of the cycle model: weight-stationary PE mesh with
-   internal skew registers (matches the figures) vs. a simpler behavioural
-   accumulate-and-drain pipeline with the same latency (faster to write).
+1. Micro-architecture: weight-stationary slot protocol with a real PE mesh in
+   the cycle model (double-buffered weights, per-column control propagation,
+   loop-back gating shim). Outer-product accumulation was considered and
+   rejected because it contradicts the PE definition, the double-buffered
+   weight storage and the loop-back.
+2. Module-level I/O is exposed at the raw PE boundary (diagonal wavefront);
+   the driver/monitor apply and remove the skew (`io_skewed = 1` default).
+3. Accumulator overflow wraps (A8).
+4. Output FIFO is a standard (non-FWFT) FIFO (A12).
+5. Simulator: Verilator (open source) with the Accellera UVM 2020 library;
+   waveforms via VCD/FST and GTKWave. Covergroups are kept in the source but
+   compiled only for simulators that implement them.
