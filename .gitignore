@@ -4,6 +4,8 @@ work/
 tmp/
 build/
 sim/results/
+__pycache__/
+*.py[cod]
 
 # Simulation outputs
 *.log
