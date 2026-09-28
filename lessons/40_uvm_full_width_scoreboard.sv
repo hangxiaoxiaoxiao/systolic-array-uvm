@@ -1,0 +1,317 @@
+// Lesson 40: place the full-width prediction queue and comparison in a UVM scoreboard.
+// Compile this file alone with UVM enabled; top: full_width_scoreboard_demo.
+// Default and +INJECT_ERROR have NOT been compiled or simulated with UVM.
+// The test provides two directed input fixtures and independent manual outputs.
+// Inputs use add_input(); an analysis port delivers outputs to write().
+// Both inputs precede both outputs; result order is a fixture assumption.
+// No DUT, interface, driver, monitor, clocks, or latency checks are implemented.
+// All submissions occur synchronously at time zero inside the test's run_phase.
+// The scoreboard checks general completeness; the test requires two matrices.
+// Default UVM errors reach check/report; fatal guards terminate earlier.
+// The reused reference function uses $fatal for bad inputs: those stops do not
+// increment UVM_FATAL counts and do not reach the normal report_phase summary.
+// A mismatch can produce both an immediate error and a check_phase summary error.
+// Judge the UVM log; an operating-system nonzero exit is not guaranteed on errors.
+// A teaching PASS concerns manual fixtures only, not verification of a DUT.
+`timescale 1ns/1ps
+`include "uvm_macros.svh"
+
+package full_width_scoreboard_lesson_pkg;
+  import uvm_pkg::*;
+
+  localparam int DIN_WIDTH = 8;
+  localparam int N = 2;
+  localparam int M = 2;
+  localparam int PRODUCT_WIDTH = 2 * DIN_WIDTH;
+  localparam int ACC_WIDTH = PRODUCT_WIDTH + 1; // Fixed M=2, not arbitrary M.
+  localparam logic signed [ACC_WIDTH-1:0] OUTPUT_MIN = -17'sd32768;
+  localparam logic signed [ACC_WIDTH-1:0] OUTPUT_MAX =  17'sd32767;
+
+  class matrix_item extends uvm_sequence_item;
+    `uvm_object_utils(matrix_item)
+
+    rand logic signed [DIN_WIDTH-1:0] A[0:N-1][0:M-1];
+    rand logic signed [DIN_WIDTH-1:0] B[0:M-1][0:N-1];
+
+    // A non-static constraint, enabled by default on every fresh object.
+    // This is a teaching scenario range, not a DUT legality requirement.
+    constraint small_values {
+      foreach (A[i,k]) A[i][k] inside {[-4:4]};
+      foreach (B[k,j]) B[k][j] inside {[-4:4]};
+    }
+
+    function new(string name = "matrix_item");
+      super.new(name);
+    endfunction
+  endclass
+
+  // A reference result record. These fields are calculated/assigned, not random.
+  class matrix_prediction extends uvm_object;
+    `uvm_object_utils(matrix_prediction)
+
+    int unsigned case_id;
+    logic signed [ACC_WIDTH-1:0] C_full[0:N-1][0:N-1];
+    logic fits_output[0:N-1][0:N-1];
+
+    // Local metadata helps identify records; it is not a tag returned by a DUT.
+    // This object does not store an A/B snapshot or an input item handle.
+    function new(string name = "matrix_prediction");
+      super.new(name);
+    endfunction
+  endclass
+
+  // Complete 16-bit result carrier. In this lesson C is filled manually,
+  // independently of the reference calculation; it is not sampled from a DUT.
+  class matrix_result extends uvm_object;
+    `uvm_object_utils(matrix_result)
+    logic signed [PRODUCT_WIDTH-1:0] C[0:N-1][0:N-1];
+
+    function new(string name = "matrix_result");
+      super.new(name);
+    endfunction
+  endclass
+
+  // input passes the object HANDLE. This function reads A/B without modifying them.
+  // Output arrays contain mathematical predictions, not DUT observations.
+  function automatic void calculate_reference(
+    input matrix_item item,
+    output logic signed [ACC_WIDTH-1:0] C_full[0:N-1][0:N-1],
+    output logic fits_output[0:N-1][0:N-1]
+  );
+    logic signed [DIN_WIDTH-1:0] input_value;
+    logic signed [PRODUCT_WIDTH-1:0] product;
+    logic signed [ACC_WIDTH-1:0] extended_product;
+    logic signed [ACC_WIDTH-1:0] sum;
+
+    if (item == null) begin
+      $fatal(1, "NULL_INPUT: reference requires an input item");
+      return;
+    end
+
+    // Reject unknown inputs before any arithmetic; retain lesson 36's scalar
+    // copy for the unknown-value check. No A/B fields are written here.
+    foreach (item.A[i,k]) begin
+      input_value = item.A[i][k];
+      if ($isunknown(input_value))
+        $fatal(1, "UNKNOWN_INPUT: A[%0d][%0d] contains X/Z", i, k);
+    end
+    foreach (item.B[k,j]) begin
+      input_value = item.B[k][j];
+      if ($isunknown(input_value))
+        $fatal(1, "UNKNOWN_INPUT: B[%0d][%0d] contains X/Z", k, j);
+    end
+
+    for (int i = 0; i < N; i++) begin
+      for (int j = 0; j < N; j++) begin
+        sum = '0;
+        for (int k = 0; k < M; k++) begin
+          // Signed operands and a signed 16-bit destination preserve the product.
+          product = item.A[i][k] * item.B[k][j];
+          // Assign the sign-extended bits to a SIGNED 17-bit variable first.
+          // Both operands of the following addition are then signed 17-bit.
+          extended_product = {product[PRODUCT_WIDTH-1], product};
+          sum = sum + extended_product;
+        end
+        C_full[i][j] = sum;
+        fits_output[i][j] = (sum >= OUTPUT_MIN) && (sum <= OUTPUT_MAX);
+      end
+    end
+  endfunction
+
+  class matrix_scoreboard extends uvm_scoreboard;
+    `uvm_component_utils(matrix_scoreboard)
+
+    uvm_analysis_imp #(matrix_result, matrix_scoreboard) output_in;
+    matrix_prediction predictions[$];
+    int unsigned enqueued_count = 0;
+    int unsigned received_count = 0;
+    int unsigned compared_elements = 0;
+    int unsigned mismatch_count = 0;
+
+    function new(string name, uvm_component parent);
+      super.new(name, parent);
+      output_in = new("output_in", this);
+    endfunction
+
+    // This lesson registers input through a helper; no input monitor is connected.
+    function void add_input(matrix_item item);
+      matrix_prediction prediction;
+      prediction = matrix_prediction::type_id::create(
+                     $sformatf("prediction_%0d", enqueued_count));
+      prediction.case_id = enqueued_count;
+      calculate_reference(item, prediction.C_full, prediction.fits_output);
+      predictions.push_back(prediction);
+      enqueued_count++;
+      // Fresh, fully calculated prediction; leave its fields read-only afterward.
+    endfunction
+
+    // The analysis imp calls write() synchronously. No waits are allowed here.
+    function void write(matrix_result actual);
+      matrix_prediction expected;
+      logic signed [PRODUCT_WIDTH-1:0] actual_element;
+      logic signed [ACC_WIDTH-1:0] actual_full;
+
+      if (actual == null) begin
+        `uvm_fatal("NULL_RESULT", "No result object was supplied")
+        return;
+      end
+      if (predictions.size() == 0) begin
+        `uvm_fatal("UNEXPECTED_RESULT", "No prediction is waiting")
+        return;
+      end
+      expected = predictions[0];
+      if (expected == null) begin
+        `uvm_fatal("NULL_PREDICTION", "Queue contains a null handle")
+        return;
+      end
+      foreach (expected.fits_output[i,j]) begin
+        if (expected.fits_output[i][j] !== 1'b1) begin
+          `uvm_fatal("REFERENCE_NOT_COMPARABLE",
+            $sformatf("Case=%0d C[%0d][%0d]=%0d needs a defined overflow rule; no DUT verdict",
+                      expected.case_id, i, j, expected.C_full[i][j]))
+          return;
+        end
+      end
+
+      // No returned transaction ID: FIFO order is assumed for this fixture.
+      expected = predictions.pop_front();
+      received_count++;
+      foreach (actual.C[i,j]) begin
+        actual_element = actual.C[i][j];
+        actual_full = {actual_element[PRODUCT_WIDTH-1], actual_element};
+        compared_elements++;
+        if (actual_full !== expected.C_full[i][j]) begin
+          mismatch_count++;
+          `uvm_error("RESULT_MISMATCH",
+            $sformatf("Case=%0d C[%0d][%0d] expected=%0d manual_actual=%0d",
+                      expected.case_id, i, j, expected.C_full[i][j], actual_element))
+        end
+      end
+      `uvm_info("RESULT_COMPARED",
+        $sformatf("Case=%0d, remaining_predictions=%0d",
+                  expected.case_id, predictions.size()), UVM_LOW)
+    endfunction
+
+    // General checks: this component does not hard-code two matrices or eight cells.
+    function void check_phase(uvm_phase phase);
+      super.check_phase(phase);
+      if (enqueued_count == 0)
+        `uvm_error("NO_INPUTS", "No inputs were registered for comparison")
+      if (received_count != enqueued_count)
+        `uvm_error("MATRIX_COUNT",
+          $sformatf("Registered=%0d, compared results=%0d", enqueued_count, received_count))
+      if (predictions.size() != 0)
+        `uvm_error("PENDING_RESULTS",
+          $sformatf("%0d predictions remain", predictions.size()))
+      if (compared_elements != received_count * N * N)
+        `uvm_error("ELEMENT_COUNT", "Not all elements of the received matrices were compared")
+      if (mismatch_count != 0)
+        `uvm_error("RESULT_CHECK_FAILED",
+          $sformatf("Found %0d element mismatches", mismatch_count))
+    endfunction
+  endclass
+
+  class full_width_scoreboard_test extends uvm_test;
+    `uvm_component_utils(full_width_scoreboard_test)
+
+    matrix_scoreboard scoreboard;
+    uvm_analysis_port #(matrix_result) result_ap;
+
+    function new(string name = "full_width_scoreboard_test", uvm_component parent = null);
+      super.new(name, parent);
+      result_ap = new("result_ap", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      scoreboard = matrix_scoreboard::type_id::create("scoreboard", this);
+    endfunction
+
+    function void connect_phase(uvm_phase phase);
+      super.connect_phase(phase);
+      result_ap.connect(scoreboard.output_in);
+    endfunction
+
+    task run_phase(uvm_phase phase);
+      matrix_item input0, input1;
+      matrix_result result0, result1;
+      phase.raise_objection(this);
+      input0 = matrix_item::type_id::create("input0");
+      input1 = matrix_item::type_id::create("input1");
+      result0 = matrix_result::type_id::create("result0");
+      result1 = matrix_result::type_id::create("result1");
+
+      // Fully assigned directed inputs. No randomize() is called in this lesson.
+      input0.A[0][0] =  1; input0.A[0][1] = -2;
+      input0.A[1][0] =  3; input0.A[1][1] =  4;
+      input0.B[0][0] = -1; input0.B[0][1] =  2;
+      input0.B[1][0] =  5; input0.B[1][1] = -3;
+
+      input1.A[0][0] = -2; input1.A[0][1] = 1;
+      input1.A[1][0] =  0; input1.A[1][1] = 3;
+      input1.B[0][0] =  1; input1.B[0][1] = 0;
+      input1.B[1][0] =  0; input1.B[1][1] = 1;
+
+      scoreboard.add_input(input0);
+      scoreboard.add_input(input1);
+      if (scoreboard.enqueued_count != 2 || scoreboard.predictions.size() != 2)
+        `uvm_fatal("ENQUEUE_COUNT", "Expected two saved predictions before results")
+
+      // Independent hand-calculated output fixtures, not copies of C_full.
+      result0.C[0][0] = -11; result0.C[0][1] =  8;
+      result0.C[1][0] =  17; result0.C[1][1] = -6;
+      // The second B is the identity, so the hand-calculated result equals A.
+      result1.C[0][0] = -2; result1.C[0][1] = 1;
+      result1.C[1][0] =  0; result1.C[1][1] = 3;
+
+      if ($test$plusargs("INJECT_ERROR")) begin
+        result0.C[1][0] = 18;
+        `uvm_info("INJECT_ERROR", "First manual C[1][0] changed from 17 to 18", UVM_LOW)
+      end
+
+      // Synchronous time-zero submissions in input order; no response timing model.
+      result_ap.write(result0);
+      result_ap.write(result1);
+
+
+      // The synchronous writes have finished before dropping this objection.
+      // No DUT activity is outstanding in this manual, time-zero fixture.
+      phase.drop_objection(this);
+    endtask
+
+    function void check_phase(uvm_phase phase);
+      super.check_phase(phase);
+      // Fixed fixture expectations belong in the test, not the reusable scoreboard.
+      if (scoreboard.enqueued_count != 2 || scoreboard.received_count != 2 ||
+          scoreboard.compared_elements != 8)
+        `uvm_error("FIXTURE_COUNT",
+          "This fixture requires two inputs, two results, and eight compared elements")
+    endfunction
+
+    function void report_phase(uvm_phase phase);
+      uvm_report_server report_server;
+      int error_count;
+      int fatal_count;
+      super.report_phase(phase);
+      report_server = uvm_report_server::get_server();
+      error_count = report_server.get_severity_count(UVM_ERROR);
+      fatal_count = report_server.get_severity_count(UVM_FATAL);
+      // All check_phase callbacks finish before report_phase begins.
+      if (error_count != 0 || fatal_count != 0) begin
+        `uvm_info("TEACHING_CHECK_FAIL",
+          $sformatf("Manual fixture checks failed: errors=%0d, fatals=%0d, mismatches=%0d",
+                    error_count, fatal_count, scoreboard.mismatch_count), UVM_NONE)
+      end
+      else begin
+        `uvm_info("TEACHING_CHECK_PASS",
+          "Two manual matrices matched queued predictions; no DUT verified.", UVM_NONE)
+      end
+    endfunction
+  endclass
+endpackage
+
+module full_width_scoreboard_demo;
+  import uvm_pkg::*;
+  import full_width_scoreboard_lesson_pkg::*;
+  initial run_test("full_width_scoreboard_test");
+endmodule
